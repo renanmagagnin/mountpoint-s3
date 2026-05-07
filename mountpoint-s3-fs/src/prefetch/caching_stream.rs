@@ -62,7 +62,7 @@ where
         };
         let (backpressure_controller, backpressure_limiter) =
             new_backpressure_controller(backpressure_config, self.mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(self.mem_limiter.clone());
+        let (part_queue, part_queue_producer) = unbounded_part_queue();
         trace!(?range, "spawning request");
 
         let request_task = {
@@ -147,7 +147,13 @@ where
         for block_index in block_range.clone() {
             match self
                 .cache
-                .get_block(cache_key, block_index, block_offset, range.object_size())
+                .get_block(
+                    cache_key,
+                    block_index,
+                    block_offset,
+                    range.object_size(),
+                    Some(self.backpressure_limiter.cursor_id()),
+                )
                 .await
             {
                 Ok(Some(block)) => {
@@ -213,6 +219,7 @@ where
             "fetching data from client"
         );
 
+        let cursor_id = self.backpressure_limiter.cursor_id();
         let request_stream = read_from_client_stream(
             &mut self.backpressure_limiter,
             &self.client,
@@ -220,7 +227,7 @@ where
             cache_key.clone(),
             initial_request_end_offset,
             block_aligned_byte_range,
-            self.config.handle_id,
+            cursor_id,
         );
 
         let mut part_composer = CachingPartComposer {
@@ -420,7 +427,6 @@ mod tests {
         mem_limiter::{MINIMUM_MEM_LIMIT, MemoryLimiter},
         memory::PagedPool,
         object::ObjectId,
-        prefetch::HandleId,
     };
 
     use super::*;
@@ -446,7 +452,6 @@ mod tests {
         let seed = 0xaa;
         let object = MockObject::ramp(seed, object_size, ETag::for_tests());
         let id = ObjectId::new(key.to_owned(), object.etag());
-        let handle_id = HandleId::new(1);
 
         // backpressure config
         let initial_request_size = 1 * MB;
@@ -480,7 +485,6 @@ mod tests {
             let config = RequestTaskConfig {
                 bucket: bucket.to_owned(),
                 object_id: id.clone(),
-                handle_id,
                 range,
                 read_part_size: client_part_size,
                 preferred_part_size: 256 * KB,
@@ -507,7 +511,6 @@ mod tests {
             let config = RequestTaskConfig {
                 bucket: bucket.to_owned(),
                 object_id: id.clone(),
-                handle_id,
                 range,
                 read_part_size: client_part_size,
                 preferred_part_size: 256 * KB,
@@ -561,7 +564,6 @@ mod tests {
                 let config = RequestTaskConfig {
                     bucket: bucket.to_owned(),
                     object_id: id.clone(),
-                    handle_id: HandleId::new(1),
                     range: RequestRange::new(object_size, offset as u64, preferred_size),
                     read_part_size: client_part_size,
                     preferred_part_size: 256 * KB,

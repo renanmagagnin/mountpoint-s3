@@ -26,6 +26,7 @@ use crate::metrics::defs::{
     CACHE_PUT_ERRORS, CACHE_PUT_IO_SIZE, CACHE_PUT_LATENCY, CACHE_TOTAL_SIZE,
 };
 use crate::object::ObjectId;
+use crate::prefetch::CursorId;
 use crate::sync::Mutex;
 
 use super::{BlockIndex, ChecksummedBytes, DataCache, DataCacheResult};
@@ -258,7 +259,12 @@ impl DiskBlock {
     }
 
     /// Deserialize an instance from `reader`.
-    fn read(reader: &mut impl Read, block_size: u64, pool: &PagedPool) -> Result<Self, DiskBlockReadWriteError> {
+    fn read(
+        reader: &mut impl Read,
+        block_size: u64,
+        pool: &PagedPool,
+        cursor_id: Option<CursorId>,
+    ) -> Result<Self, DiskBlockReadWriteError> {
         let header: DiskBlockHeader = bincode::decode_from_std_read(reader, BINCODE_CONFIG)?;
 
         if header.block_len > block_size {
@@ -266,7 +272,7 @@ impl DiskBlock {
         }
 
         let size = header.block_len as usize;
-        let mut buffer = pool.get_buffer_mut(size, BufferKind::DiskCache);
+        let mut buffer = pool.get_buffer_mut(size, BufferKind::DiskCache, cursor_id);
         buffer.fill_from_reader(reader)?;
         let data = buffer.into_bytes();
 
@@ -337,6 +343,7 @@ impl DiskDataCache {
         cache_key: &ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
+        cursor_id: Option<CursorId>,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
         trace!(
             key = ?cache_key.key(),
@@ -360,7 +367,7 @@ impl DiskDataCache {
             return Err(DataCacheError::InvalidBlockContent);
         }
 
-        let block = DiskBlock::read(&mut file, self.block_size(), &self.pool)
+        let block = DiskBlock::read(&mut file, self.block_size(), &self.pool, cursor_id)
             .inspect_err(|e| warn!(path = ?path.as_ref(), "block could not be deserialized: {:?}", e))?;
         let bytes = block
             .data(cache_key, block_idx, block_offset)
@@ -464,6 +471,7 @@ impl DataCache for DiskDataCache {
         block_idx: BlockIndex,
         block_offset: u64,
         _object_size: usize,
+        cursor_id: Option<CursorId>,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
         if block_offset != block_idx * self.config.block_size {
             return Err(DataCacheError::InvalidBlockOffset);
@@ -471,7 +479,7 @@ impl DataCache for DiskDataCache {
         let start = Instant::now();
         let block_key = DiskBlockKey::new(cache_key, block_idx);
         let path = self.get_path_for_block_key(&block_key);
-        let result = match self.read_block(&path, cache_key, block_idx, block_offset) {
+        let result = match self.read_block(&path, cache_key, block_idx, block_offset, cursor_id) {
             Ok(None) => {
                 // Cache miss.
                 Ok(None)
@@ -769,7 +777,7 @@ mod tests {
         );
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0, object_1_size, None)
             .await
             .expect("cache should be accessible");
         assert!(
@@ -783,7 +791,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0, object_1_size, None)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -798,7 +806,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(&cache_key_2, 0, 0, object_2_size, None)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -813,7 +821,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(&cache_key_1, 1, block_size, object_1_size, None)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -824,7 +832,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0, object_1_size, None)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -856,7 +864,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key, 0, 0, slice.len())
+            .get_block(&cache_key, 0, 0, slice.len(), None)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -890,7 +898,7 @@ mod tests {
             object_size: usize,
         ) -> bool {
             if let Some(retrieved) = cache
-                .get_block(cache_key, block_idx, block_idx * (BLOCK_SIZE) as u64, object_size)
+                .get_block(cache_key, block_idx, block_idx * (BLOCK_SIZE) as u64, object_size, None)
                 .await
                 .expect("cache should be accessible")
             {
@@ -1106,7 +1114,8 @@ mod tests {
         replace_u64_at(&mut buf, offset, u64::MAX);
 
         let pool = PagedPool::new_with_candidate_sizes([MAX_LENGTH as usize]);
-        let err = DiskBlock::read(&mut Cursor::new(buf), MAX_LENGTH, &pool).expect_err("deserialization should fail");
+        let err =
+            DiskBlock::read(&mut Cursor::new(buf), MAX_LENGTH, &pool, None).expect_err("deserialization should fail");
         match length_to_corrupt {
             "key" | "etag" => assert!(matches!(
                 err,
@@ -1147,7 +1156,7 @@ mod tests {
             let handle = pool
                 .spawn_with_handle(async move {
                     let block = data_cache
-                        .get_block(&cache_key, block_idx, block_offset, object_size)
+                        .get_block(&cache_key, block_idx, block_offset, object_size, None)
                         .await
                         .expect("get_block should not return error");
                     if block.is_none() {

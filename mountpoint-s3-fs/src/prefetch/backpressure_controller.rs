@@ -7,6 +7,7 @@ use tracing::trace;
 
 use crate::mem_limiter::{BufferArea, MemoryLimiter};
 
+use super::CursorId;
 use super::PrefetchReadError;
 
 #[derive(Debug)]
@@ -92,6 +93,8 @@ pub struct BackpressureController {
     ///
     /// For example, when memory is low we should scale down [Self::preferred_read_window_size].
     mem_limiter: Arc<MemoryLimiter>,
+    /// Unique cursor ID for per-cursor memory reservation tracking.
+    cursor_id: CursorId,
     /// Enable alignment of read window end to part boundary
     read_window_alignment_config: ReadWindowAlignmentConfig,
 }
@@ -110,6 +113,9 @@ pub struct BackpressureLimiter {
     /// End offset for the request we want to apply backpressure. The request can return
     /// data up to this offset *exclusively*.
     request_end_offset: u64,
+    /// The unique cursor ID for this backpressure pair. Used as `custom_id` on CRT
+    /// meta-requests and for per-cursor memory tracking in the pool's `on_reserve` callback.
+    cursor_id: CursorId,
 }
 
 /// Creates a [BackpressureController] and its related [BackpressureLimiter].
@@ -122,8 +128,9 @@ pub fn new_backpressure_controller(
 ) -> (BackpressureController, BackpressureLimiter) {
     // Minimum window size multiplier as the scaling up and down won't work if the multiplier is 1.
     const MIN_WINDOW_SIZE_MULTIPLIER: usize = 2;
+    let cursor_id = mem_limiter.next_cursor_id();
     let read_window_end_offset = config.request_range.start + config.initial_read_window_size as u64;
-    mem_limiter.reserve(BufferArea::Prefetch, config.initial_read_window_size as u64);
+    mem_limiter.reserve(cursor_id, BufferArea::Prefetch, config.initial_read_window_size as u64);
 
     let (read_window_updater, read_window_increment_queue) = unbounded();
     let read_window_increment_queue = ReadWindowIncrementQueue::new(read_window_increment_queue);
@@ -137,6 +144,7 @@ pub fn new_backpressure_controller(
         read_window_end_offset,
         next_read_offset: config.request_range.start,
         request_end_offset: config.request_range.end,
+        cursor_id,
         mem_limiter,
         read_window_alignment_config: config.read_window_alignment_config,
     };
@@ -147,6 +155,7 @@ pub fn new_backpressure_controller(
         read_window_increment_queue,
         read_window_end_offset,
         request_end_offset: config.request_range.end,
+        cursor_id,
     };
 
     (controller, limiter)
@@ -164,7 +173,6 @@ impl BackpressureController {
             // Note, that this may come from a backwards seek, so offsets observed by this method are not necessarily ascending
             BackpressureFeedbackEvent::DataRead { offset, length } => {
                 self.next_read_offset = offset + length as u64;
-                self.mem_limiter.release(BufferArea::Prefetch, length as u64);
                 let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset) as usize;
 
                 // Increment the read window only if the remaining window reaches some threshold i.e. half of it left.
@@ -194,14 +202,18 @@ impl BackpressureController {
                     // read window size.
                     if self.preferred_read_window_size <= self.min_read_window_size {
                         trace!(new_read_window_end_offset, "sending a read window increment");
-                        self.mem_limiter.reserve(BufferArea::Prefetch, to_increase as u64);
+                        self.mem_limiter
+                            .reserve(self.cursor_id, BufferArea::Prefetch, to_increase as u64);
                         self.increment_read_window(to_increase).await;
                         break;
                     }
 
                     // Try to reserve the memory for the length we want to increase before sending the request,
                     // scale down the read window if it fails.
-                    if self.mem_limiter.try_reserve(BufferArea::Prefetch, to_increase as u64) {
+                    if self
+                        .mem_limiter
+                        .try_reserve(self.cursor_id, BufferArea::Prefetch, to_increase as u64)
+                    {
                         trace!(new_read_window_end_offset, "sending a read window increment");
                         self.increment_read_window(to_increase).await;
                         break;
@@ -282,19 +294,21 @@ impl BackpressureController {
 
 impl Drop for BackpressureController {
     fn drop(&mut self) {
-        debug_assert!(
-            self.next_read_offset <= self.request_end_offset,
-            "invariant: the next read offset should never be larger than the request end offset",
-        );
-        // Free up memory we have reserved for the read window.
-        let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset);
-        self.mem_limiter.release(BufferArea::Prefetch, remaining_window);
+        // Release whatever remains of this cursor's reservation. The per-cursor counter
+        // tracks only the unallocated portion — pool allocations already decremented it
+        // via the on_reserve callback.
+        self.mem_limiter.release_cursor(self.cursor_id, BufferArea::Prefetch);
     }
 }
 
 impl BackpressureLimiter {
     pub fn read_window_end_offset(&self) -> u64 {
         self.read_window_end_offset
+    }
+
+    /// The unique cursor ID for this backpressure pair, used as `custom_id` on CRT requests.
+    pub fn cursor_id(&self) -> CursorId {
+        self.cursor_id
     }
 
     /// Wait until the backpressure window moves ahead of the given offset.

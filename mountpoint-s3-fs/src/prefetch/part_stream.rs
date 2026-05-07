@@ -14,7 +14,7 @@ use crate::mem_limiter::MemoryLimiter;
 use crate::object::ObjectId;
 use crate::prefetch::backpressure_controller::ReadWindowAlignmentConfig;
 
-use super::HandleId;
+use super::CursorId;
 use super::PrefetchReadError;
 use super::backpressure_controller::{BackpressureConfig, BackpressureLimiter, new_backpressure_controller};
 use super::part::{Part, PartSource};
@@ -37,7 +37,6 @@ pub trait ObjectPartStream<Client: ObjectClient + Clone + Send + Sync + 'static>
 pub struct RequestTaskConfig {
     pub bucket: String,
     pub object_id: ObjectId,
-    pub handle_id: HandleId,
     pub range: RequestRange,
     pub read_part_size: usize,
     pub preferred_part_size: usize,
@@ -250,7 +249,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
         };
         let (backpressure_controller, mut backpressure_limiter) =
             new_backpressure_controller(backpressure_config, self.mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(self.mem_limiter.clone());
+        let (part_queue, part_queue_producer) = unbounded_part_queue();
         trace!(?range, "spawning request");
 
         let span = debug_span!("prefetch", ?range);
@@ -259,6 +258,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
             .runtime
             .spawn_with_handle(
                 async move {
+                    let cursor_id = backpressure_limiter.cursor_id();
                     let initial_request_end_offset = config.range.start() + config.initial_request_size as u64;
                     let request_stream = read_from_client_stream(
                         &mut backpressure_limiter,
@@ -267,7 +267,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
                         config.object_id.clone(),
                         initial_request_end_offset,
                         config.range,
-                        config.handle_id,
+                        cursor_id,
                     );
 
                     let part_composer = ClientPartComposer {
@@ -348,7 +348,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
     object_id: ObjectId,
     initial_request_end_offset: u64,
     range: RequestRange,
-    handle_id: HandleId,
+    cursor_id: CursorId,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
         // Let's start by issuing the first request with a range trimmed to initial read window offset
@@ -361,7 +361,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 first_req_range.into(),
-                handle_id,
+                cursor_id,
             );
             pin_mut!(first_request_stream);
             while let Some(next) = first_request_stream.next().await {
@@ -414,7 +414,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 range.into(),
-                handle_id,
+                cursor_id,
             );
             pin_mut!(request_stream);
             while let Some(next) = request_stream.next().await {
@@ -433,11 +433,11 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
     bucket: String,
     id: ObjectId,
     request_range: Range<u64>,
-    handle_id: HandleId,
+    cursor_id: CursorId,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
         let mut request = client
-            .get_object(&bucket, id.key(), &GetObjectParams::new().range(Some(request_range.clone())).if_match(Some(id.etag().clone())).custom_id(Some(handle_id.as_raw())))
+            .get_object(&bucket, id.key(), &GetObjectParams::new().range(Some(request_range.clone())).if_match(Some(id.etag().clone())).custom_id(Some(cursor_id.as_raw())))
             .await
             .inspect_err(|e| error!(key=id.key(), error=?e, "GetObject request failed"))
             .map_err(|err| PrefetchReadError::get_request_failed(err, &bucket, id.key()))?;
