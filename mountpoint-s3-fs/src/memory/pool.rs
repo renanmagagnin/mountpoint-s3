@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use mountpoint_s3_client::config::{MemoryPool, MetaRequest};
 
+use crate::prefetch::{CursorId, HandleId};
 use crate::sync::{Arc, RwLock};
 
 use super::buffers::{PoolBuffer, PoolBufferMut};
+use super::limiter::{ActiveReadGuard, BufferArea, MemoryLimiter};
 use super::pages::{Page, PagedBufferPtr};
 use super::stats::{BufferKind, PoolStats, SizePoolStats};
-use crate::prefetch::CursorId;
 
 /// A pool of reusable fixed-size buffers allocated in large pages.
 ///
@@ -62,7 +63,11 @@ impl PagedPool {
     /// Ignores invalid (0 or greater than [MAX_BUFFER_SIZE](Self::MAX_BUFFER_SIZE))
     /// or duplicate values for buffer sizes. If no valid value is provided,
     /// uses [DEFAULT_BUFFER_SIZE](Self::DEFAULT_BUFFER_SIZE).
-    pub fn new_with_candidate_sizes(buffer_sizes: impl Into<Vec<usize>>) -> Self {
+    ///
+    /// When `mem_limit` is provided, an internal [MemoryLimiter] is created and the
+    /// `on_reserve` callback is wired automatically. Use `u64::MAX` as the limit
+    /// to effectively disable memory limiting (the limiter will never reject).
+    pub fn new_with_candidate_sizes(buffer_sizes: impl Into<Vec<usize>>, mem_limit: u64) -> Self {
         let mut ordered_sizes: Vec<_> = buffer_sizes.into();
         ordered_sizes.retain(|&size| size > 0 && size <= Self::MAX_BUFFER_SIZE);
         ordered_sizes.dedup();
@@ -80,11 +85,29 @@ impl PagedPool {
             })
             .collect();
 
+        let limiter = MemoryLimiter::new(mem_limit);
+        // Wire the on_reserve callback internally: when the pool allocates a buffer,
+        // the callback decrements the limiter's mem_reserved counters.
+        let mem_reserved_cb = limiter.mem_reserved_arc();
+        let mem_reserved_per_cursor_cb = limiter.mem_reserved_per_cursor_arc();
+        stats.set_on_reserve(Arc::new(move |bytes, cursor_id| {
+            MemoryLimiter::on_pool_reserve(bytes, cursor_id, &mem_reserved_cb, &mem_reserved_per_cursor_cb);
+        }));
+
         let inner = PagedPoolInner {
             ordered_size_pools,
             stats,
+            limiter,
         };
         Self { inner: Arc::new(inner) }
+    }
+
+    /// Create a pool without effective memory limiting.
+    ///
+    /// This is a convenience for tests and examples that don't need memory budgeting.
+    /// The internal limiter uses `u64::MAX` as its limit, so it never rejects reservations.
+    pub fn new_with_candidate_sizes_unlimited(buffer_sizes: impl Into<Vec<usize>>) -> Self {
+        Self::new_with_candidate_sizes(buffer_sizes, u64::MAX)
     }
 
     /// Trim empty pages in the pool.
@@ -114,12 +137,6 @@ impl PagedPool {
     /// Return the total reserved memory in bytes across all buffer kinds.
     pub fn total_reserved_bytes(&self) -> usize {
         self.inner.stats.total_reserved_bytes()
-    }
-
-    /// Register a callback to be invoked whenever bytes are reserved in the pool.
-    /// Must be called before any pool allocations occur to ensure accurate accounting.
-    pub fn set_on_reserve(&self, callback: Arc<dyn Fn(usize, Option<CursorId>) + Send + Sync>) {
-        self.inner.stats.set_on_reserve(callback);
     }
 
     /// Get a new empty mutable buffer from the pool with the requested capacity.
@@ -165,6 +182,61 @@ impl PagedPool {
             .map(|pool| pool.stats.reserved_buffers(kind))
             .sum()
     }
+
+    /// Expose the internal stats for testing purposes (e.g., to wire a standalone limiter).
+    #[cfg(test)]
+    pub(crate) fn inner_stats(&self) -> &PoolStats {
+        &self.inner.stats
+    }
+
+    /// Expose the internal limiter for testing purposes.
+    #[cfg(test)]
+    pub(crate) fn inner_limiter(&self) -> &MemoryLimiter {
+        &self.inner.limiter
+    }
+
+    // ─── Delegation methods for MemoryLimiter ───────────────────────────────────
+
+    /// Reserve memory for future uses. Always succeeds (unconditional).
+    /// Delegates to the internal MemoryLimiter.
+    pub fn reserve(&self, cursor_id: CursorId, area: BufferArea, size: u64) {
+        self.inner.limiter.reserve(cursor_id, area, size);
+    }
+
+    /// Reserve memory if available. Returns `false` if over budget.
+    /// Delegates to the internal MemoryLimiter.
+    pub fn try_reserve(&self, cursor_id: CursorId, area: BufferArea, size: u64) -> bool {
+        self.inner.limiter.try_reserve(cursor_id, area, size, &self.inner.stats)
+    }
+
+    /// Release all remaining reservation for a cursor and remove it from tracking.
+    /// Delegates to the internal MemoryLimiter.
+    pub fn release_cursor(&self, cursor_id: CursorId, area: BufferArea) {
+        self.inner.limiter.release_cursor(cursor_id, area);
+    }
+
+    /// Generate a new unique CursorId.
+    /// Delegates to the internal MemoryLimiter.
+    pub fn next_cursor_id(&self) -> CursorId {
+        self.inner.limiter.next_cursor_id()
+    }
+
+    /// Query available memory.
+    /// Delegates to the internal MemoryLimiter.
+    pub fn available_mem(&self) -> u64 {
+        self.inner.limiter.available_mem(&self.inner.stats)
+    }
+
+    /// Record that a FUSE read is active for the given handle.
+    /// Returns a guard that clears the active read on drop.
+    pub fn set_active_read(&self, handle_id: HandleId, offset: u64, size: usize) -> ActiveReadGuard {
+        self.inner.limiter.set_active_read(handle_id, offset, size)
+    }
+
+    /// Check if the given handle has an active read overlapping the specified range.
+    pub fn has_active_read_in_range(&self, handle_id: HandleId, offset: u64, size: usize) -> bool {
+        self.inner.limiter.has_active_read_in_range(handle_id, offset, size)
+    }
 }
 
 impl MemoryPool for PagedPool {
@@ -187,6 +259,9 @@ impl MemoryPool for PagedPool {
 struct PagedPoolInner {
     ordered_size_pools: Vec<SizePool>,
     stats: Arc<PoolStats>,
+    /// Memory limiter owned by the pool. Use `u64::MAX` as the limit to effectively
+    /// disable memory limiting (the limiter will never reject).
+    limiter: MemoryLimiter,
 }
 
 impl PagedPoolInner {
@@ -300,14 +375,14 @@ mod tests {
     #[test_case(&[1, 2, 3], &[5, 10])]
     #[test_case(&vec![42u8; 1000], &[128, 1024])]
     fn test_from_slice(original: &[u8], buffer_sizes: &[usize]) {
-        let pool = PagedPool::new_with_candidate_sizes(buffer_sizes);
+        let pool = PagedPool::new_with_candidate_sizes_unlimited(buffer_sizes);
         let bytes = copy_from_slice(&pool, original);
         assert_eq!(original, bytes.as_ref());
     }
 
     #[test_case(&[5, 10, 1024])]
     fn test_pages(buffer_sizes: &[usize]) {
-        let pool = PagedPool::new_with_candidate_sizes(buffer_sizes);
+        let pool = PagedPool::new_with_candidate_sizes_unlimited(buffer_sizes);
 
         for &size in buffer_sizes {
             let original = vec![1u8; size];
@@ -343,7 +418,7 @@ mod tests {
     #[test_matrix(&vec![42u8; 1000], &[128, 1024], [None, Some(Duration::from_millis(10))])]
     #[test_matrix(&vec![42u8; 10000], &[128, 1024, 2024, 8192], [None, Some(Duration::from_millis(10))])]
     fn stress_test(original: &[u8], buffer_sizes: &[usize], schedule: Option<Duration>) {
-        let pool = PagedPool::new_with_candidate_sizes(buffer_sizes);
+        let pool = PagedPool::new_with_candidate_sizes_unlimited(buffer_sizes);
         if let Some(duration) = schedule {
             pool.schedule_trim(duration);
         }
@@ -377,7 +452,7 @@ mod tests {
     fn test_reserved_bytes() {
         let buffer_size = 1024;
         let reservations = HashMap::from([(BufferKind::GetObject, 10), (BufferKind::Other, 20)]);
-        let pool = PagedPool::new_with_candidate_sizes([buffer_size]);
+        let pool = PagedPool::new_with_candidate_sizes_unlimited([buffer_size]);
         let mut buffers = Vec::new();
         for (&kind, &count) in &reservations {
             for _ in 0..count {

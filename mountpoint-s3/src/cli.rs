@@ -12,7 +12,7 @@ use mountpoint_s3_fs::data_cache::{CacheLimit, DataCacheConfig, DiskDataCacheCon
 use mountpoint_s3_fs::fs::{CacheConfig, ServerSideEncryption, TimeToLive};
 use mountpoint_s3_fs::fuse::config::{FuseOptions, FuseSessionConfig, MountPoint};
 use mountpoint_s3_fs::logging::{LoggingConfig, prepare_log_file_name};
-use mountpoint_s3_fs::mem_limiter::{MINIMUM_MEM_LIMIT, effective_total_memory};
+use mountpoint_s3_fs::memory::{MINIMUM_MEM_LIMIT, effective_total_memory};
 use mountpoint_s3_fs::s3::config::{ClientConfig, PartConfig, TargetThroughputSetting};
 use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path, S3PathError, S3Personality};
 use mountpoint_s3_fs::{S3FilesystemConfig, autoconfigure, metrics};
@@ -490,7 +490,7 @@ impl CliArgs {
         Ok(s3path)
     }
 
-    fn mem_limit(&self) -> u64 {
+    pub(crate) fn mem_limit(&self) -> u64 {
         let mut mem_limit = MINIMUM_MEM_LIMIT;
 
         let default_mem_target = (effective_total_memory() as f64 * 0.95) as u64;

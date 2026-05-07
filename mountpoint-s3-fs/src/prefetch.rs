@@ -42,10 +42,9 @@ use tracing::trace;
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::data_cache::DataCache;
 use crate::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT};
-use crate::mem_limiter::MemoryLimiter;
+use crate::memory::PagedPool;
 use crate::metrics::defs::{FUSE_CACHE_HIT, PREFETCH_RESET_STATE};
 use crate::object::ObjectId;
-use crate::sync::Arc;
 
 mod backpressure_controller;
 mod builder;
@@ -219,7 +218,7 @@ fn determine_max_read_size() -> usize {
 #[derive(Debug)]
 pub struct Prefetcher<Client> {
     part_stream: PartStream<Client>,
-    mem_limiter: Arc<MemoryLimiter>,
+    pool: PagedPool,
     config: PrefetcherConfig,
 }
 
@@ -241,10 +240,10 @@ where
     }
 
     /// Create a new [Prefetcher] from the given [ObjectPartStream] instance.
-    pub fn new(part_stream: PartStream<Client>, mem_limiter: Arc<MemoryLimiter>, config: PrefetcherConfig) -> Self {
+    pub fn new(part_stream: PartStream<Client>, pool: PagedPool, config: PrefetcherConfig) -> Self {
         Self {
             part_stream,
-            mem_limiter,
+            pool,
             config,
         }
     }
@@ -263,7 +262,7 @@ where
         PrefetchGetObject::new(
             self.part_stream.clone(),
             self.config,
-            self.mem_limiter.clone(),
+            self.pool.clone(),
             bucket,
             object_id,
             handle_id,
@@ -280,7 +279,7 @@ where
 {
     part_stream: PartStream<Client>,
     config: PrefetcherConfig,
-    mem_limiter: Arc<MemoryLimiter>,
+    pool: PagedPool,
     backpressure_task: Option<RequestTask<Client>>,
     // Invariant: the offset of the last byte in this window is always
     // self.next_sequential_read_offset - 1.
@@ -306,7 +305,7 @@ where
     fn new(
         part_stream: PartStream<Client>,
         config: PrefetcherConfig,
-        mem_limiter: Arc<MemoryLimiter>,
+        pool: PagedPool,
         bucket: String,
         object_id: ObjectId,
         handle_id: HandleId,
@@ -316,7 +315,7 @@ where
         PrefetchGetObject {
             part_stream,
             config,
-            mem_limiter,
+            pool,
             backpressure_task: None,
             backward_seek_window: SeekWindow::new(max_backward_seek_distance),
             preferred_part_size: 128 * 1024,
@@ -393,9 +392,7 @@ where
         // the skipped bytes the prefetcher must consume to reach the requested offset.
         let active_start = self.next_sequential_read_offset.min(offset);
         let active_size = length + offset.saturating_sub(self.next_sequential_read_offset) as usize;
-        let _active_read_guard = self
-            .mem_limiter
-            .set_active_read(self.handle_id, active_start, active_size);
+        let _active_read_guard = self.pool.set_active_read(self.handle_id, active_start, active_size);
 
         // Try to seek if this read is not sequential, and if seeking fails, cancel and reset the
         // prefetcher.
@@ -593,7 +590,7 @@ mod tests {
 
     use crate::Runtime;
     use crate::data_cache::InMemoryDataCache;
-    use crate::mem_limiter::{MINIMUM_MEM_LIMIT, MemoryLimiter};
+    use crate::memory::MINIMUM_MEM_LIMIT;
     use crate::memory::PagedPool;
     use crate::sync::Arc;
 
@@ -644,8 +641,8 @@ mod tests {
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
-        let pool = PagedPool::new_with_candidate_sizes([client.read_part_size(), client.write_part_size()]);
-        let mem_limiter = Arc::new(MemoryLimiter::new(pool, MINIMUM_MEM_LIMIT));
+        let pool =
+            PagedPool::new_with_candidate_sizes([client.read_part_size(), client.write_part_size()], MINIMUM_MEM_LIMIT);
         let runtime = Runtime::new(ThreadPool::builder().pool_size(1).create().unwrap());
         let builder = match prefetcher_type {
             PrefetcherType::Default => Prefetcher::default_builder(client),
@@ -654,7 +651,7 @@ mod tests {
                 Prefetcher::caching_builder(cache, client)
             }
         };
-        builder.build(runtime, mem_limiter, prefetcher_config)
+        builder.build(runtime, pool, prefetcher_config)
     }
 
     fn run_sequential_read_test(prefetcher_type: PrefetcherType, size: u64, read_size: usize, test_config: TestConfig) {
@@ -1394,8 +1391,7 @@ mod tests {
                     .initial_read_window_size(part_size)
                     .build(),
             );
-            let pool = PagedPool::new_with_candidate_sizes([part_size]);
-            let mem_limiter = Arc::new(MemoryLimiter::new(pool, MINIMUM_MEM_LIMIT));
+            let pool = PagedPool::new_with_candidate_sizes([part_size], MINIMUM_MEM_LIMIT);
             let object = MockObject::ramp(0xaa, object_size as usize, ETag::for_tests());
             let file_etag = object.etag();
 
@@ -1410,7 +1406,7 @@ mod tests {
             };
 
             let prefetcher =
-                Prefetcher::default_builder(client).build(Runtime::new(ShuttleRuntime), mem_limiter, prefetcher_config);
+                Prefetcher::default_builder(client).build(Runtime::new(ShuttleRuntime), pool, prefetcher_config);
             let object_id = ObjectId::new("hello".to_owned(), file_etag);
             let fh = HandleId::new(1);
             let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, fh, object_size);
@@ -1457,8 +1453,7 @@ mod tests {
                     .initial_read_window_size(part_size)
                     .build(),
             );
-            let pool = PagedPool::new_with_candidate_sizes([part_size]);
-            let mem_limiter = Arc::new(MemoryLimiter::new(pool, MINIMUM_MEM_LIMIT));
+            let pool = PagedPool::new_with_candidate_sizes([part_size], MINIMUM_MEM_LIMIT);
             let object = MockObject::ramp(0xaa, object_size as usize, ETag::for_tests());
             let file_etag = object.etag();
 
@@ -1473,7 +1468,7 @@ mod tests {
             };
 
             let prefetcher =
-                Prefetcher::default_builder(client).build(Runtime::new(ShuttleRuntime), mem_limiter, prefetcher_config);
+                Prefetcher::default_builder(client).build(Runtime::new(ShuttleRuntime), pool, prefetcher_config);
             let object_id = ObjectId::new("hello".to_owned(), file_etag);
             let fh = HandleId::new(1);
             let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, fh, object_size);

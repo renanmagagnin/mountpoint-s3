@@ -3,7 +3,7 @@ use std::time::Duration;
 use nix::unistd::{getgid, getuid};
 
 use crate::content_type::ContentTypeDetection;
-use crate::mem_limiter::MINIMUM_MEM_LIMIT;
+use crate::memory::MINIMUM_MEM_LIMIT;
 use crate::metablock::WriteMode;
 use crate::prefetch::PrefetcherConfig;
 use crate::s3::S3Personality;
