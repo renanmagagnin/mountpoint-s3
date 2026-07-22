@@ -52,6 +52,7 @@ mod cursor;
 mod part;
 mod part_queue;
 mod part_stream;
+mod scratch_buffer;
 mod seek_window;
 mod task;
 

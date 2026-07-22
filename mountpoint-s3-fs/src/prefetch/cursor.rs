@@ -8,6 +8,7 @@ use crate::metrics::defs::PREFETCH_RESET_STATE;
 use crate::object::ObjectId;
 use crate::sync::{Arc, AsyncMutex, Mutex};
 
+use super::scratch_buffer;
 use super::seek_window::SeekWindow;
 use super::task::RequestTask;
 use super::{PrefetchReadError, PrefetcherConfig};
@@ -181,7 +182,23 @@ where
             }
 
             let part_len = part_bytes.len() as u64;
-            response.extend(part_bytes)?;
+            if response.is_empty() {
+                // This read spans multiple parts, so we will loop and block below allocating the
+                // next part's buffer. Copy this first part out of its pool buffer instead of
+                // aliasing it: holding a pool buffer across that allocation can deadlock under
+                // memory pressure, since the read reserve keeps only enough headroom for the next
+                // allocation, not for a held part as well. `ChecksummedBytes::extend` would take
+                // its empty-self fast path here and keep pointing at the pool buffer, so we copy
+                // explicitly, reusing the part's checksum to avoid recomputing it. The copy is
+                // drawn from a reusable scratch pool (not a fresh malloc) to avoid per-read
+                // allocator churn. The clone pushed to the backward seek window above then holds
+                // the only pool-buffer reference, which the memory limiter's pruning backstop can
+                // reclaim.
+                let (bytes, checksum) = part_bytes.into_inner()?;
+                response = ChecksummedBytes::new_from_inner_data(scratch_buffer::global().copy_from_slice(&bytes), checksum);
+            } else {
+                response.extend(part_bytes)?;
+            }
             to_read -= part_len;
         }
 
